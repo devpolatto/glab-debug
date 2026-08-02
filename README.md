@@ -1,5 +1,7 @@
 # glab-debug
 
+[![ci](https://github.com/devpolatto/glab-debug/actions/workflows/ci.yml/badge.svg?branch=development&event=push)](https://github.com/devpolatto/glab-debug/actions/workflows/ci.yml?query=branch%3Adevelopment+event%3Apush)
+
 Utilitário de diagnóstico do GitLab construído **em cima da CLI `glab`** — nada de token
 próprio, nada de config de autenticação: se o `glab` está logado, o `glab-debug` funciona.
 
