@@ -1,0 +1,27 @@
+name: guard-master
+
+# A proteção de branch bloqueia push direto na master e exige pull request, mas não
+# sabe restringir de qual branch o PR vem. Este check fecha essa lacuna: PR para a
+# master só passa se a origem for a development.
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  source-branch:
+    name: source-branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verifica a branch de origem
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if [ "$HEAD_REF" != "development" ]; then
+            echo "::error::PR para master só é aceito a partir de 'development' (origem: $HEAD_REF)."
+            exit 1
+          fi
+          echo "Origem 'development' — liberado."
