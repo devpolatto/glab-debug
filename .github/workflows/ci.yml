@@ -1,0 +1,79 @@
+name: ci
+
+# Testes em todo PR para a development, e no próprio push da development depois do
+# merge. O gate de promoção mora no run de push, não no do PR: durante o PR as
+# mudanças ainda não estão na development, então promover ali levaria para a master
+# um estado que não inclui o PR.
+
+on:
+  pull_request:
+    branches: [development]
+  push:
+    branches: [development]
+  workflow_dispatch: # permite promover sob demanda, sem precisar de um push novo
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"] # mínimo declarado no pyproject e o usado no dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Instala as dependências travadas
+        run: uv sync --frozen --python ${{ matrix.python }}
+
+      - name: pytest
+        run: uv run pytest -q
+
+  promote:
+    name: promote
+    needs: tests
+    # No run do PR não há o que promover; o gate só aparece no push da development
+    # (ou num workflow_dispatch manual).
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    # O environment `promote` exige aprovação: é aqui que o run fica parado
+    # esperando o clique em "Review deployments".
+    environment: promote
+    steps:
+      - name: Abre o PR de promoção para a master
+        env:
+          # PAT, e não GITHUB_TOKEN: evento criado pelo token padrão não aciona
+          # workflow, e o PR ficaria travado esperando o check `source-branch`.
+          GH_TOKEN: ${{ secrets.PROMOTE_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          ahead=$(gh api "repos/$GH_REPO/compare/master...development" --jq '.ahead_by')
+          if [ "$ahead" -eq 0 ]; then
+            echo "::notice::development não está à frente da master — nada a promover."
+            exit 0
+          fi
+
+          url=$(gh pr list --base master --head development --state open --json url --jq '.[0].url // empty')
+          if [ -n "$url" ]; then
+            echo "::notice::PR de promoção já aberto: $url"
+            exit 0
+          fi
+
+          body=$(printf 'Promoção aprovada no gate manual do run %s.\n\nTestes verdes em py3.11 e py3.14 no commit `%s`.' "$RUN_URL" "$GITHUB_SHA")
+          gh pr create --base master --head development \
+            --title "promote: development → master ($ahead commits)" \
+            --body "$body"
