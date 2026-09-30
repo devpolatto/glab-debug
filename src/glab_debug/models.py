@@ -64,6 +64,27 @@ class Pipeline(_Payload):
     queued_duration: float | None = None
     web_url: str | None = None
     user: User | None = None
+    yaml_errors: str | None = None
+
+
+class PipelineRef(_Payload):
+    id: int
+    status: str | None = None
+    web_url: str | None = None
+
+
+class MergeRequest(_Payload):
+    iid: int
+    title: str | None = None
+    state: str
+    source_branch: str | None = None
+    target_branch: str | None = None
+    sha: str | None = None
+    merge_commit_sha: str | None = None
+    squash_commit_sha: str | None = None
+    merged_at: datetime | None = None
+    head_pipeline: PipelineRef | None = None
+    web_url: str | None = None
 
 
 class Job(_Payload):
@@ -178,3 +199,42 @@ class PipelineReport(BaseModel):
 
 def as_seconds(delta: timedelta) -> float:
     return max(delta.total_seconds(), 0.0)
+
+
+# --------------------------------------------------------------------------- #
+# pipeline status
+# --------------------------------------------------------------------------- #
+
+
+class StatusJob(BaseModel):
+    id: int
+    name: str
+    stage: str
+    status: str
+    allow_failure: bool = False
+    failure_reason: str | None = None
+    duration: float | None = None
+    web_url: str | None = None
+
+    @property
+    def status_label(self) -> str:
+        return f"{self.status}(allowed)" if self.status == "failed" and self.allow_failure else self.status
+
+
+class StatusReport(BaseModel):
+    """Saída de `pipeline status`: em que pé está a pipeline e quais jobs importam."""
+
+    project: Project
+    pipeline: Pipeline
+    via: str | None = Field(
+        default=None,
+        description="Como a pipeline foi resolvida a partir de um MR: merge_commit ou head_pipeline.",
+    )
+    merge_request: MergeRequest | None = None
+    counts: dict[str, int]
+    jobs: list[StatusJob]
+    hidden: int = Field(default=0, description="Jobs fora da lista (manual/created/skipped ou fora do filtro).")
+    filters: list[str] = Field(default_factory=list)
+    alerts: list[Alert]
+    waited: float | None = Field(default=None, description="Segundos aguardando com --wait.")
+    timed_out: bool = False
