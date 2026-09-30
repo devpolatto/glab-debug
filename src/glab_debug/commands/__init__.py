@@ -6,8 +6,8 @@ subcomandos. Para adicionar um grupo novo, escreva o módulo e liste-o em `GROUP
 
 from __future__ import annotations
 
-from . import pipeline
+from . import job, pipeline
 
-GROUPS = (pipeline,)
+GROUPS = (pipeline, job)
 
 __all__ = ["GROUPS"]

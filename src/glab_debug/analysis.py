@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from fnmatch import fnmatchcase
 
 from .models import (
     Alert,
     Job,
     JobReport,
+    MergeRequest,
     Pipeline,
     PipelineReport,
     Project,
     StageReport,
+    StatusJob,
+    StatusReport,
     Timing,
     as_seconds,
 )
@@ -25,6 +29,18 @@ DOMINANT_SHARE = 0.5
 IDLE_WARN_SHARE = 0.10
 
 _UNFINISHED = {"created", "manual", "scheduled", "skipped", "pending", "waiting_for_resource"}
+
+#: Estados de job que entram na lista do `status` sem filtro. `manual`, `created`,
+#: `scheduled` e `skipped` viram só contagem: em pipeline GitOps, são a maioria e não dizem
+#: nada sobre o que rodou.
+INFORMATIVE = {
+    "failed", "running", "pending", "preparing", "waiting_for_resource",
+    "canceled", "canceling", "success",
+}
+
+#: Estados em que a pipeline (ou o job) ainda vai mudar sozinha. `manual` não está aqui de
+#: propósito: é onde as pipelines GitOps param, e para quem espera é um estado final.
+IN_PROGRESS = {"created", "waiting_for_resource", "preparing", "pending", "running", "canceling"}
 
 
 def analyse_pipeline(
@@ -269,3 +285,99 @@ def _build_alerts(
         )
 
     return alerts
+
+
+# --------------------------------------------------------------------------- #
+# pipeline status
+# --------------------------------------------------------------------------- #
+
+
+def job_matches(name: str, globs: list[str]) -> bool:
+    return any(fnmatchcase(name, g) for g in globs)
+
+
+def still_running(pipeline: Pipeline, jobs: list[Job], globs: list[str]) -> bool:
+    """Critério do `--wait`: com filtro, olha só os jobs filtrados; sem filtro, a pipeline."""
+    if globs:
+        chosen = [j for j in jobs if job_matches(j.name, globs)]
+        if chosen:
+            return any(j.status in IN_PROGRESS for j in chosen)
+    return pipeline.status in IN_PROGRESS
+
+
+def analyse_status(
+    project: Project,
+    pipeline: Pipeline,
+    jobs: list[Job],
+    globs: list[str] | None = None,
+    show_all: bool = False,
+    via: str | None = None,
+    merge_request: MergeRequest | None = None,
+) -> StatusReport:
+    globs = globs or []
+    ordered = sorted(jobs, key=lambda j: (j.started_at or j.created_at or _EPOCH, j.id))
+
+    if globs:
+        chosen = [j for j in ordered if job_matches(j.name, globs)]
+    elif show_all:
+        chosen = ordered
+    else:
+        chosen = [j for j in ordered if j.status in INFORMATIVE]
+
+    listed = [
+        StatusJob(
+            id=j.id,
+            name=j.name,
+            stage=j.stage,
+            status=j.status,
+            allow_failure=j.allow_failure,
+            failure_reason=j.failure_reason,
+            duration=j.duration,
+            web_url=j.web_url,
+        )
+        for j in chosen
+    ]
+
+    alerts: list[Alert] = []
+    for job in listed:
+        if job.status != "failed":
+            continue
+        reason = f" ({job.failure_reason})" if job.failure_reason else ""
+        if job.allow_failure:
+            alerts.append(Alert(level="aviso", message=f"{job.stage}/{job.name} falhou{reason}, mas é allow_failure."))
+        else:
+            alerts.append(Alert(level="erro", message=f"{job.stage}/{job.name} falhou{reason} — job {job.id}."))
+
+    if pipeline.status == "failed" and not any(j.status == "failed" for j in jobs):
+        detail = f": {pipeline.yaml_errors}" if pipeline.yaml_errors else ""
+        alerts.append(
+            Alert(
+                level="erro",
+                message=(
+                    f"Pipeline falhou sem nenhum job falho{detail} — erro na criação "
+                    "(YAML, rules, include ou permissão). Detalhe só na UI."
+                ),
+            )
+        )
+
+    if globs and not listed:
+        alerts.append(Alert(level="aviso", message=f"Nenhum job bate com o filtro: {', '.join(globs)}."))
+    if via == "head_pipeline":
+        alerts.append(
+            Alert(
+                level="aviso",
+                message="MR não mergeado: esta é a pipeline do MR (head_pipeline), não a do branch alvo.",
+            )
+        )
+
+    return StatusReport(
+        project=project,
+        pipeline=pipeline,
+        via=via,
+        merge_request=merge_request,
+        counts=dict(sorted(Counter(j.status for j in jobs).items(), key=lambda kv: (-kv[1], kv[0]))),
+        jobs=listed,
+        hidden=len(jobs) - len(listed),
+        filters=globs,
+        alerts=alerts,
+    )

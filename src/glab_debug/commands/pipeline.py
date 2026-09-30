@@ -1,18 +1,22 @@
 """Grupo `pipeline` — análise de execuções de CI.
 
-Hoje só tem `monitor`: quebra um pipeline por job, dizendo quanto o pipeline
-inteiro levou e quanto cada job consumiu dentro dele.
+- `monitor`: quebra um pipeline por job, dizendo quanto o pipeline inteiro levou e
+  quanto cada job consumiu dentro dele.
+- `status`: em que pé está a pipeline (resolvida por ID, commit, ref ou MR) e quais
+  jobs importam, opcionalmente esperando ela terminar.
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
+import time
 
 from .. import fmt
-from ..analysis import analyse_pipeline
+from ..analysis import analyse_pipeline, analyse_status, still_running
 from ..config import Settings
 from ..gitlab import GitLabClient, GlabError, infer_project_from_git
-from ..models import JobReport, PipelineReport
+from ..models import Alert, JobReport, MergeRequest, Pipeline, PipelineReport, StatusReport
 
 SORT_KEYS = ("duration", "start", "stage", "name")
 
@@ -64,20 +68,64 @@ def register(subparsers: argparse._SubParsersAction) -> None:
     )
     monitor.set_defaults(handler=run_monitor)
 
+    status = commands.add_parser(
+        "status",
+        help="Status de um pipeline e dos jobs que importam",
+        description=(
+            "Resolve o pipeline por ID, commit, ref ou MR e mostra o status dos jobs "
+            "relevantes. Jobs manual/created/skipped viram contagem. Com --wait, espera "
+            "o pipeline (ou os jobs filtrados) terminar."
+        ),
+    )
+    target = status.add_mutually_exclusive_group(required=True)
+    target.add_argument("pipeline_id", type=int, nargs="?", metavar="<pipeline-id>", help="ID do pipeline.")
+    target.add_argument("--sha", help="Commit: usa o pipeline mais recente desse SHA.")
+    target.add_argument("--ref", help="Branch ou tag: usa o último pipeline do ref.")
+    target.add_argument(
+        "--mr",
+        type=int,
+        metavar="IID",
+        help="MR: se mergeado, o pipeline do merge commit no branch alvo; se aberto, o do MR.",
+    )
+    status.add_argument(
+        "-p",
+        "--project",
+        help="Projeto: path com namespace, ID numérico ou URL. Default: remote git ou config.",
+    )
+    status.add_argument(
+        "--job",
+        dest="jobs",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Filtra jobs por nome (fnmatch, repetível). Jobs filtrados aparecem em qualquer estado.",
+    )
+    status.add_argument("--all", dest="show_all", action="store_true", help="Lista todos os jobs.")
+    status.add_argument("--wait", action="store_true", help="Espera o pipeline (ou os jobs filtrados) terminar.")
+    status.add_argument("--interval", type=int, default=15, metavar="SEG", help="Intervalo do --wait (default: 15).")
+    status.add_argument(
+        "--wait-timeout", type=int, default=1800, metavar="SEG", help="Teto do --wait (default: 1800)."
+    )
+    status.set_defaults(handler=run_status)
+
 
 # --------------------------------------------------------------------------- #
 # Execução
 # --------------------------------------------------------------------------- #
 
 
-def run_monitor(args: argparse.Namespace, settings: Settings) -> int:
+def resolve_project(args: argparse.Namespace, settings: Settings) -> str:
     project = args.project or settings.project or infer_project_from_git()
     if not project:
         raise GlabError(
             "Projeto não informado. Use --project, defina `project` em "
             "~/.config/glab-debug/config.toml ou rode dentro do repositório."
         )
+    return project
 
+
+def run_monitor(args: argparse.Namespace, settings: Settings) -> int:
+    project = resolve_project(args, settings)
     client = GitLabClient(settings)
     report = analyse_pipeline(
         project=client.project(project),
@@ -95,6 +143,104 @@ def run_monitor(args: argparse.Namespace, settings: Settings) -> int:
     print(renderers[settings.output_format]())
 
     return 1 if any(a.level == "erro" for a in report.alerts) else 0
+
+
+def resolve_pipeline(
+    client: GitLabClient, project: str, args: argparse.Namespace
+) -> tuple[Pipeline, str | None, MergeRequest | None]:
+    """Devolve o pipeline alvo, como ele foi achado (`via`) e o MR, quando for o caso."""
+    if args.pipeline_id is not None:
+        return client.pipeline(project, args.pipeline_id), None, None
+    if args.ref:
+        return client.latest_pipeline(project, args.ref), None, None
+    if args.sha:
+        sha = client.full_sha(project, args.sha)
+        found = client.pipelines_by_sha(project, sha)
+        if not found:
+            raise GlabError(f"Nenhum pipeline para o commit {sha[:8]}.")
+        return client.pipeline(project, found[0].id), None, None
+
+    mr = client.merge_request(project, args.mr)
+    if mr.state == "merged":
+        # Merge por fast-forward não gera merge commit: o head do MR vira o commit do alvo.
+        sha = mr.merge_commit_sha or mr.squash_commit_sha or mr.sha
+        if not sha:
+            raise GlabError(f"MR !{mr.iid} mergeado, mas sem SHA de merge na API.")
+        found = client.pipelines_by_sha(project, sha, ref=mr.target_branch)
+        if not found:
+            raise GlabError(
+                f"MR !{mr.iid} mergeado em {mr.target_branch}, mas nenhum pipeline para {sha[:8]} "
+                "(o CI pode não ter disparado para esse caminho)."
+            )
+        return client.pipeline(project, found[0].id), "merge_commit", mr
+    if mr.head_pipeline is None:
+        raise GlabError(f"MR !{mr.iid} ({mr.state}) não tem pipeline.")
+    return client.pipeline(project, mr.head_pipeline.id), "head_pipeline", mr
+
+
+def run_status(args: argparse.Namespace, settings: Settings) -> int:
+    project = resolve_project(args, settings)
+    client = GitLabClient(settings)
+    proj = client.project(project)
+    pipeline, via, mr = resolve_pipeline(client, project, args)
+    jobs = client.pipeline_jobs(project, pipeline.id)
+
+    waited: float | None = None
+    timed_out = False
+    if args.wait:
+        started = time.monotonic()
+        while still_running(pipeline, jobs, args.jobs):
+            elapsed = time.monotonic() - started
+            if elapsed >= args.wait_timeout:
+                timed_out = True
+                break
+            if settings.output_format == "table":
+                print(
+                    f"[glab-debug] pipeline {pipeline.id} em {pipeline.status}, "
+                    f"aguardando ({elapsed:.0f}s)…",
+                    file=sys.stderr,
+                )
+            time.sleep(max(min(args.interval, args.wait_timeout - elapsed), 1))
+            pipeline = client.pipeline(project, pipeline.id)
+            jobs = client.pipeline_jobs(project, pipeline.id)
+        waited = time.monotonic() - started
+
+    report = analyse_status(
+        project=proj,
+        pipeline=pipeline,
+        jobs=jobs,
+        globs=args.jobs,
+        show_all=args.show_all,
+        via=via,
+        merge_request=mr,
+    )
+    report.waited = waited
+    report.timed_out = timed_out
+    if timed_out:
+        report.alerts.append(
+            Alert(
+                level="aviso",
+                message=f"--wait-timeout de {args.wait_timeout}s estourado com o pipeline em {pipeline.status}.",
+            )
+        )
+
+    renderers = {
+        "json": lambda: report.model_dump_json(),
+        "compact": lambda: render_status_compact(report),
+        "markdown": lambda: render_status_markdown(report),
+        "table": lambda: render_status_table(report),
+    }
+    print(renderers[settings.output_format]())
+    return status_exit_code(report)
+
+
+def status_exit_code(report: StatusReport) -> int:
+    """`1` job falhou (prevalece) · `3` --wait estourou · `0` o resto, inclusive `manual`."""
+    if any(a.level == "erro" for a in report.alerts):
+        return 1
+    if report.timed_out:
+        return 3
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -435,4 +581,131 @@ def render_markdown(report: PipelineReport, args: argparse.Namespace) -> str:
         marks = {"erro": "❌", "aviso": "⚠️", "info": "ℹ️"}
         out += [f"- {marks.get(a.level, '•')} {a.message}" for a in report.alerts]
 
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# pipeline status — renderizadores
+# --------------------------------------------------------------------------- #
+
+
+def _status_head(report: StatusReport) -> list[str]:
+    p = report.pipeline
+    mr = report.merge_request
+    return [
+        f"pipeline {p.id}",
+        report.project.path_with_namespace,
+        f"ref={p.ref}" if p.ref else "",
+        f"sha={(p.sha or '')[:8]}" if p.sha else "",
+        f"status={p.status}",
+        f"source={p.source}" if p.source else "",
+        f"via={report.via}" if report.via else "",
+        f"mr=!{mr.iid}" if mr else "",
+        f"mr_state={mr.state}" if mr else "",
+        f"waited={report.waited:.0f}s" if report.waited is not None else "",
+        "timeout" if report.timed_out else "",
+    ]
+
+
+def render_status_compact(report: StatusReport) -> str:
+    counts = " ".join(f"{k}={v}" for k, v in report.counts.items())
+    lines = [
+        " ".join(x for x in _status_head(report) if x),
+        f"url {report.pipeline.web_url}" if report.pipeline.web_url else "",
+        f"counts {counts}" if counts else "counts -",
+        f"filter {' '.join(report.filters)}" if report.filters else "",
+        "jobs stage/name status dur reason id",
+    ]
+    for job in report.jobs:
+        lines.append(
+            " ".join(
+                [
+                    f"{job.stage}/{job.name}",
+                    job.status_label,
+                    fmt.seconds(job.duration, "-"),
+                    job.failure_reason or "-",
+                    str(job.id),
+                ]
+            )
+        )
+    if report.hidden:
+        lines.append(f"+{report.hidden} jobs fora da lista")
+    lines += [f"{a.level} {a.message}" for a in report.alerts]
+    return "\n".join(x for x in lines if x)
+
+
+def _status_jobs_table(report: StatusReport) -> fmt.Table:
+    table = fmt.Table(["stage", "job", "status", "duração", "motivo", "id"], "lllrlr")
+    for job in report.jobs:
+        table.add(
+            job.stage,
+            job.name,
+            fmt.paint_status(job.status) + (" (allowed)" if job.allow_failure and job.status == "failed" else ""),
+            fmt.duration(job.duration),
+            job.failure_reason or "—",
+            str(job.id),
+        )
+    return table
+
+
+def render_status_table(report: StatusReport) -> str:
+    p = report.pipeline
+    out = [f"{fmt.paint(f'Pipeline {p.id}', 'bold')} · {report.project.path_with_namespace}"]
+    meta = [
+        f"ref {fmt.paint(p.ref or '—', 'cyan')}",
+        f"sha {(p.sha or '')[:8] or '—'}",
+        f"status {fmt.paint_status(p.status)}",
+        f"source {p.source or '—'}",
+    ]
+    out.append("  " + " · ".join(meta))
+    if report.merge_request:
+        mr = report.merge_request
+        via = {"merge_commit": "pipeline do merge commit", "head_pipeline": "pipeline do próprio MR"}
+        out.append(f"  MR !{mr.iid} ({mr.state}) → {via.get(report.via or '', report.via or '—')}")
+    if report.waited is not None:
+        out.append(f"  aguardou {fmt.duration(report.waited)}" + (" (timeout)" if report.timed_out else ""))
+    if p.web_url:
+        out.append("  " + fmt.paint(p.web_url, "dim"))
+
+    out += ["", fmt.paint("Contagem", "bold")]
+    out.append("  " + (" · ".join(f"{k} {v}" for k, v in report.counts.items()) or "—"))
+    if report.filters:
+        out.append("  filtro: " + ", ".join(report.filters))
+
+    out += ["", fmt.paint("Jobs", "bold"), _status_jobs_table(report).render()]
+    if report.hidden:
+        out.append(fmt.paint(f"  … +{report.hidden} jobs fora da lista (use --all)", "dim"))
+
+    if report.alerts:
+        out += ["", fmt.paint("Alertas", "bold")]
+        out += [f"  {fmt.level_mark(a.level)} {a.message}" for a in report.alerts]
+    return "\n".join(out)
+
+
+def render_status_markdown(report: StatusReport) -> str:
+    p = report.pipeline
+    pid = f"[{p.id}]({p.web_url})" if p.web_url else str(p.id)
+    out = [f"# Pipeline {p.id} — {report.project.path_with_namespace}", ""]
+    out.append(f"- **Pipeline**: {pid} · status `{p.status}` · source `{p.source or '—'}`")
+    out.append(f"- **Ref**: `{p.ref or '—'}` @ `{(p.sha or '')[:8]}`")
+    if report.merge_request:
+        mr = report.merge_request
+        out.append(f"- **MR**: !{mr.iid} (`{mr.state}`) via `{report.via}`")
+    if report.waited is not None:
+        out.append(f"- **Aguardou**: {fmt.duration(report.waited)}" + (" _(timeout)_" if report.timed_out else ""))
+    out.append("- **Contagem**: " + (", ".join(f"{k} {v}" for k, v in report.counts.items()) or "—"))
+    if report.filters:
+        out.append("- **Filtro**: " + ", ".join(f"`{g}`" for g in report.filters))
+
+    table = fmt.Table(["stage", "job", "status", "duração", "motivo", "id"], "lllrlr")
+    for job in report.jobs:
+        name = f"[{job.name}]({job.web_url})" if job.web_url else job.name
+        table.add(job.stage, name, f"`{job.status_label}`", fmt.duration(job.duration), job.failure_reason or "—", str(job.id))
+    out += ["", "## Jobs", "", table.render_markdown()]
+    if report.hidden:
+        out += ["", f"_+{report.hidden} jobs fora da lista_"]
+
+    if report.alerts:
+        marks = {"erro": "❌", "aviso": "⚠️", "info": "ℹ️"}
+        out += ["", "## Alertas", ""] + [f"- {marks.get(a.level, '•')} {a.message}" for a in report.alerts]
     return "\n".join(out)
