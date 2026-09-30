@@ -189,3 +189,72 @@ def test_pipeline_falha_sem_job_falho_e_erro():
 
     with_yaml = analyse_status(PROJECT, make_pipeline(status="failed", yaml_errors="jobs:x config key may not be used"), [])
     assert "config key may not be used" in with_yaml.alerts[0].message
+
+
+# --------------------------------------------------------------------------- #
+# --retried
+# --------------------------------------------------------------------------- #
+
+
+def flaky_jobs():
+    """build falhou na 1ª tentativa e passou na 2ª; test falhou nas duas."""
+    return [
+        make_job("build", "build", start=0, dur=700, status="failed", failure_reason="script_failure", job_id=1),
+        make_job("build", "build", start=710, dur=680, job_id=5),
+        make_job("test", "test", start=0, dur=10, status="failed", failure_reason="script_failure", job_id=2),
+        make_job("test", "test", start=20, dur=10, status="failed", failure_reason="script_failure", job_id=6),
+        make_job("deploy", "deploy", start=0, dur=0, status="manual", job_id=3),
+    ]
+
+
+def test_retried_lista_as_tentativas_antes_da_final():
+    report = analyse_status(PROJECT, make_pipeline(status="failed"), flaky_jobs(), include_retried=True)
+    rows = [(j.name, j.id, j.attempt, j.attempts_total) for j in report.jobs]
+    assert rows == [("build", 1, 1, 2), ("build", 5, 2, 2), ("test", 2, 1, 2), ("test", 6, 2, 2)]
+    assert report.retried == 2 and report.hidden == 1
+
+
+def test_retried_nao_entra_na_contagem_nem_no_exit():
+    report = analyse_status(
+        PROJECT, make_pipeline(status="success"), [j for j in flaky_jobs() if j.name != "test"], include_retried=True
+    )
+    assert report.counts == {"manual": 1, "success": 1}
+    assert status_exit_code(report) == 0
+    assert not any(a.level == "erro" for a in report.alerts)
+    [flaky] = [a for a in report.alerts if "tentativas" in a.message]
+    assert flaky.level == "aviso"
+    assert "falhou em 1 de 2 tentativas (script_failure) e passou na última" in flaky.message
+
+
+def test_retried_com_a_ultima_falhando_continua_erro():
+    report = analyse_status(PROJECT, make_pipeline(status="failed"), flaky_jobs(), include_retried=True)
+    errors = [a.message for a in report.alerts if a.level == "erro"]
+    assert errors == ["test/test falhou (script_failure) — job 6."]
+    assert status_exit_code(report) == 1
+
+
+def test_sem_retried_a_api_ja_manda_so_a_ultima_e_nada_muda():
+    latest = [j for j in flaky_jobs() if j.id not in (1, 2)]
+    report = analyse_status(PROJECT, make_pipeline(status="failed"), latest)
+    assert all(not j.is_retry for j in report.jobs)
+    assert report.retried == 0
+    assert "attempt" not in render_status_compact(report)
+
+
+def test_compact_mostra_coluna_de_tentativa_e_nao_perde_dado():
+    report = analyse_status(PROJECT, make_pipeline(status="failed"), flaky_jobs(), include_retried=True)
+    compact = render_status_compact(report)
+    assert "jobs stage/name status dur reason id attempt" in compact
+    assert "build/build failed 700.0 script_failure 1 1/2" in compact
+    assert "retried 2" in compact
+    table = render_status_table(report)
+    assert "1/2" in table and "tentativas descartadas: 2" in table
+    assert "1/2" in render_status_markdown(report)
+
+
+def test_still_running_ignora_tentativa_antiga_em_andamento():
+    jobs = [
+        make_job("deploy", "deploy", 0, 1, status="running", job_id=1),  # dado inconsistente da API
+        make_job("deploy", "deploy", 5, 1, status="success", job_id=2),
+    ]
+    assert not still_running(make_pipeline(status="running"), jobs, ["deploy"])

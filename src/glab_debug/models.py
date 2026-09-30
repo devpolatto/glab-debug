@@ -218,6 +218,12 @@ class StatusJob(BaseModel):
     failure_reason: str | None = None
     duration: float | None = None
     web_url: str | None = None
+    attempt: int = Field(default=1, description="Ordem da tentativa quando o job foi reexecutado.")
+    attempts_total: int = Field(default=1, description="Total de tentativas deste job.")
+
+    @property
+    def is_retry(self) -> bool:
+        return self.attempts_total > 1
 
     @property
     def status_label(self) -> str:
@@ -237,6 +243,8 @@ class StatusReport(BaseModel):
     counts: dict[str, int]
     jobs: list[StatusJob]
     hidden: int = Field(default=0, description="Jobs fora da lista (manual/created/skipped ou fora do filtro).")
+    retried: int = Field(default=0, description="Tentativas descartadas consultadas (só com --retried).")
+    include_retried: bool = False
     filters: list[str] = Field(default_factory=list)
     alerts: list[Alert]
     waited: float | None = Field(default=None, description="Segundos aguardando com --wait.")
