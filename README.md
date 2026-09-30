@@ -101,6 +101,7 @@ deploy/deploy:govone-v2-africa-prd success 86.8 - 366779
 |:---|:---|
 | `--job GLOB` | filtra por nome (`fnmatch`, repetível); jobs filtrados aparecem em qualquer estado |
 | `--all` | lista todos os jobs |
+| `--retried` | inclui tentativas descartadas de jobs reexecutados (coluna `attempt`, ex. `1/2`). Elas **não** entram na contagem nem no código de saída — vale a última tentativa, como na UI — e uma tentativa falha seguida de sucesso vira aviso de instabilidade |
 | `--wait` | espera o pipeline — ou só os jobs filtrados — sair de `created/pending/running…`. `manual` conta como final |
 | `--interval`, `--wait-timeout` | polling do `--wait` (default 15s e 1800s) |
 

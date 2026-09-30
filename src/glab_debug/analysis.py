@@ -296,13 +296,41 @@ def job_matches(name: str, globs: list[str]) -> bool:
     return any(fnmatchcase(name, g) for g in globs)
 
 
+def _attempt_groups(jobs: list[Job]) -> dict[tuple[str, str], list[Job]]:
+    """Tentativas de cada job, da mais antiga para a mais recente (retry ganha ID maior)."""
+    groups: dict[tuple[str, str], list[Job]] = defaultdict(list)
+    for job in sorted(jobs, key=lambda j: j.id):
+        groups[(job.stage, job.name)].append(job)
+    return groups
+
+
+def latest_attempts(jobs: list[Job]) -> list[Job]:
+    """Só a última tentativa de cada job — é ela que decide o resultado do pipeline."""
+    return [attempts[-1] for attempts in _attempt_groups(jobs).values()]
+
+
 def still_running(pipeline: Pipeline, jobs: list[Job], globs: list[str]) -> bool:
     """Critério do `--wait`: com filtro, olha só os jobs filtrados; sem filtro, a pipeline."""
     if globs:
-        chosen = [j for j in jobs if job_matches(j.name, globs)]
+        chosen = [j for j in latest_attempts(jobs) if job_matches(j.name, globs)]
         if chosen:
             return any(j.status in IN_PROGRESS for j in chosen)
     return pipeline.status in IN_PROGRESS
+
+
+def _status_job(job: Job, attempt: int, total: int) -> StatusJob:
+    return StatusJob(
+        id=job.id,
+        name=job.name,
+        stage=job.stage,
+        status=job.status,
+        allow_failure=job.allow_failure,
+        failure_reason=job.failure_reason,
+        duration=job.duration,
+        web_url=job.web_url,
+        attempt=attempt,
+        attempts_total=total,
+    )
 
 
 def analyse_status(
@@ -313,42 +341,68 @@ def analyse_status(
     show_all: bool = False,
     via: str | None = None,
     merge_request: MergeRequest | None = None,
+    include_retried: bool = False,
 ) -> StatusReport:
+    """Status do pipeline.
+
+    Com `include_retried`, `jobs` traz também as tentativas descartadas. Elas aparecem na
+    lista logo antes da tentativa final, mas **não** entram em `counts` nem geram `erro`:
+    quem decide o resultado é a última tentativa de cada job, como na interface do GitLab.
+    """
     globs = globs or []
-    ordered = sorted(jobs, key=lambda j: (j.started_at or j.created_at or _EPOCH, j.id))
+    groups = _attempt_groups(jobs)
+    # Ordena pela primeira tentativa, que segue o fluxo do pipeline; um retry tardio não
+    # deve empurrar o job para depois dos stages seguintes.
+    first = {key: attempts[0] for key, attempts in groups.items()}
+    latest = [
+        groups[key][-1]
+        for key in sorted(groups, key=lambda k: (first[k].started_at or first[k].created_at or _EPOCH, first[k].id))
+    ]
 
     if globs:
-        chosen = [j for j in ordered if job_matches(j.name, globs)]
+        chosen = [j for j in latest if job_matches(j.name, globs)]
     elif show_all:
-        chosen = ordered
+        chosen = latest
     else:
-        chosen = [j for j in ordered if j.status in INFORMATIVE]
+        chosen = [j for j in latest if j.status in INFORMATIVE]
 
-    listed = [
-        StatusJob(
-            id=j.id,
-            name=j.name,
-            stage=j.stage,
-            status=j.status,
-            allow_failure=j.allow_failure,
-            failure_reason=j.failure_reason,
-            duration=j.duration,
-            web_url=j.web_url,
-        )
-        for j in chosen
-    ]
+    listed: list[StatusJob] = []
+    for job in chosen:
+        attempts = groups[(job.stage, job.name)]
+        total = len(attempts)
+        if include_retried:
+            listed += [_status_job(a, i, total) for i, a in enumerate(attempts[:-1], start=1)]
+        listed.append(_status_job(job, total, total))
 
     alerts: list[Alert] = []
     for job in listed:
-        if job.status != "failed":
-            continue
+        if job.status != "failed" or (job.is_retry and job.attempt < job.attempts_total):
+            continue  # tentativa descartada não decide o resultado: vira aviso abaixo
         reason = f" ({job.failure_reason})" if job.failure_reason else ""
         if job.allow_failure:
             alerts.append(Alert(level="aviso", message=f"{job.stage}/{job.name} falhou{reason}, mas é allow_failure."))
         else:
             alerts.append(Alert(level="erro", message=f"{job.stage}/{job.name} falhou{reason} — job {job.id}."))
 
-    if pipeline.status == "failed" and not any(j.status == "failed" for j in jobs):
+    for job in chosen:
+        attempts = groups[(job.stage, job.name)]
+        failed_before = [a for a in attempts[:-1] if a.status == "failed"]
+        if not failed_before:
+            continue
+        reasons = sorted({a.failure_reason for a in failed_before if a.failure_reason})
+        why = f" ({', '.join(reasons)})" if reasons else ""
+        outcome = "e passou na última" if job.status == "success" else f"e a última está em `{job.status}`"
+        alerts.append(
+            Alert(
+                level="aviso",
+                message=(
+                    f"{job.stage}/{job.name} falhou em {len(failed_before)} de {len(attempts)} "
+                    f"tentativas{why} {outcome} — possível instabilidade (runner ou teste flaky)."
+                ),
+            )
+        )
+
+    if pipeline.status == "failed" and not any(j.status == "failed" for j in latest):
         detail = f": {pipeline.yaml_errors}" if pipeline.yaml_errors else ""
         alerts.append(
             Alert(
@@ -360,7 +414,7 @@ def analyse_status(
             )
         )
 
-    if globs and not listed:
+    if globs and not chosen:
         alerts.append(Alert(level="aviso", message=f"Nenhum job bate com o filtro: {', '.join(globs)}."))
     if via == "head_pipeline":
         alerts.append(
@@ -375,9 +429,11 @@ def analyse_status(
         pipeline=pipeline,
         via=via,
         merge_request=merge_request,
-        counts=dict(sorted(Counter(j.status for j in jobs).items(), key=lambda kv: (-kv[1], kv[0]))),
+        counts=dict(sorted(Counter(j.status for j in latest).items(), key=lambda kv: (-kv[1], kv[0]))),
         jobs=listed,
-        hidden=len(jobs) - len(listed),
+        hidden=len(latest) - len(chosen),
+        retried=len(jobs) - len(latest),
+        include_retried=include_retried,
         filters=globs,
         alerts=alerts,
     )

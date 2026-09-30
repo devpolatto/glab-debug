@@ -47,6 +47,15 @@ glab api (subprocess) → payloads pydantic → relatório derivado → renderiz
   `Table` (renderiza texto *e* markdown), `timeline_bar`. Largura de coluna usa
   `visible_len`, que ignora ANSI.
 
+### Tentativas reexecutadas no `status`
+
+Com `--retried`, a API devolve também as tentativas descartadas. `analysis.analyse_status`
+agrupa por `(stage, name)` e ordena por ID (retry ganha ID maior). **Só a última tentativa
+decide o resultado**: `counts`, `erro` e o código de saída saem de `latest`. As anteriores
+aparecem na lista, e uma falha seguida de sucesso vira `aviso`. A ordenação usa o início da
+*primeira* tentativa, para um retry tardio não empurrar o job para depois dos stages
+seguintes. O `--wait` também olha só a última tentativa.
+
 ### Trace: limpeza, redação e helmfile
 
 Os comandos do grupo `job` leem o trace cru, que não é JSON (`GitLabClient.get_text`). O

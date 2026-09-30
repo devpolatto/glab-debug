@@ -101,6 +101,14 @@ def register(subparsers: argparse._SubParsersAction) -> None:
         help="Filtra jobs por nome (fnmatch, repetível). Jobs filtrados aparecem em qualquer estado.",
     )
     status.add_argument("--all", dest="show_all", action="store_true", help="Lista todos os jobs.")
+    status.add_argument(
+        "--retried",
+        action="store_true",
+        help=(
+            "Inclui tentativas descartadas de jobs reexecutados. Elas aparecem na lista, mas "
+            "não entram na contagem nem no código de saída: vale a última tentativa."
+        ),
+    )
     status.add_argument("--wait", action="store_true", help="Espera o pipeline (ou os jobs filtrados) terminar.")
     status.add_argument("--interval", type=int, default=15, metavar="SEG", help="Intervalo do --wait (default: 15).")
     status.add_argument(
@@ -183,7 +191,7 @@ def run_status(args: argparse.Namespace, settings: Settings) -> int:
     client = GitLabClient(settings)
     proj = client.project(project)
     pipeline, via, mr = resolve_pipeline(client, project, args)
-    jobs = client.pipeline_jobs(project, pipeline.id)
+    jobs = client.pipeline_jobs(project, pipeline.id, include_retried=args.retried)
 
     waited: float | None = None
     timed_out = False
@@ -202,7 +210,7 @@ def run_status(args: argparse.Namespace, settings: Settings) -> int:
                 )
             time.sleep(max(min(args.interval, args.wait_timeout - elapsed), 1))
             pipeline = client.pipeline(project, pipeline.id)
-            jobs = client.pipeline_jobs(project, pipeline.id)
+            jobs = client.pipeline_jobs(project, pipeline.id, include_retried=args.retried)
         waited = time.monotonic() - started
 
     report = analyse_status(
@@ -213,6 +221,7 @@ def run_status(args: argparse.Namespace, settings: Settings) -> int:
         show_all=args.show_all,
         via=via,
         merge_request=mr,
+        include_retried=args.retried,
     )
     report.waited = waited
     report.timed_out = timed_out
@@ -614,37 +623,53 @@ def render_status_compact(report: StatusReport) -> str:
         f"url {report.pipeline.web_url}" if report.pipeline.web_url else "",
         f"counts {counts}" if counts else "counts -",
         f"filter {' '.join(report.filters)}" if report.filters else "",
-        "jobs stage/name status dur reason id",
+        f"retried {report.retried}" if report.include_retried else "",
+        "jobs stage/name status dur reason id" + (" attempt" if _show_attempts(report) else ""),
     ]
     for job in report.jobs:
-        lines.append(
-            " ".join(
-                [
-                    f"{job.stage}/{job.name}",
-                    job.status_label,
-                    fmt.seconds(job.duration, "-"),
-                    job.failure_reason or "-",
-                    str(job.id),
-                ]
-            )
-        )
+        row = [
+            f"{job.stage}/{job.name}",
+            job.status_label,
+            fmt.seconds(job.duration, "-"),
+            job.failure_reason or "-",
+            str(job.id),
+        ]
+        if _show_attempts(report):
+            row.append(_attempt(job))
+        lines.append(" ".join(row))
     if report.hidden:
         lines.append(f"+{report.hidden} jobs fora da lista")
     lines += [f"{a.level} {a.message}" for a in report.alerts]
     return "\n".join(x for x in lines if x)
 
 
-def _status_jobs_table(report: StatusReport) -> fmt.Table:
-    table = fmt.Table(["stage", "job", "status", "duração", "motivo", "id"], "lllrlr")
+def _show_attempts(report: StatusReport) -> bool:
+    return any(j.is_retry for j in report.jobs)
+
+
+def _attempt(job) -> str:
+    return f"{job.attempt}/{job.attempts_total}" if job.is_retry else "-"
+
+
+def _status_jobs_table(report: StatusReport, markdown: bool = False) -> fmt.Table:
+    headers, aligns = ["stage", "job", "status", "duração", "motivo", "id"], "lllrlr"
+    if _show_attempts(report):
+        headers.append("tent.")
+        aligns += "r"
+    table = fmt.Table(headers, aligns)
     for job in report.jobs:
-        table.add(
-            job.stage,
-            job.name,
-            fmt.paint_status(job.status) + (" (allowed)" if job.allow_failure and job.status == "failed" else ""),
-            fmt.duration(job.duration),
-            job.failure_reason or "—",
-            str(job.id),
-        )
+        if markdown:
+            name = f"[{job.name}]({job.web_url})" if job.web_url else job.name
+            status = f"`{job.status_label}`"
+            reason = job.failure_reason or "—"
+        else:
+            name = job.name
+            status = fmt.paint_status(job.status) + (" (allowed)" if job.allow_failure and job.status == "failed" else "")
+            reason = job.failure_reason or "—"
+        cells = [job.stage, name, status, fmt.duration(job.duration), reason, str(job.id)]
+        if _show_attempts(report):
+            cells.append(_attempt(job).replace("-", "—"))
+        table.add(*cells)
     return table
 
 
@@ -671,6 +696,8 @@ def render_status_table(report: StatusReport) -> str:
     out.append("  " + (" · ".join(f"{k} {v}" for k, v in report.counts.items()) or "—"))
     if report.filters:
         out.append("  filtro: " + ", ".join(report.filters))
+    if report.include_retried:
+        out.append(f"  tentativas descartadas: {report.retried} (fora da contagem)")
 
     out += ["", fmt.paint("Jobs", "bold"), _status_jobs_table(report).render()]
     if report.hidden:
@@ -697,11 +724,9 @@ def render_status_markdown(report: StatusReport) -> str:
     if report.filters:
         out.append("- **Filtro**: " + ", ".join(f"`{g}`" for g in report.filters))
 
-    table = fmt.Table(["stage", "job", "status", "duração", "motivo", "id"], "lllrlr")
-    for job in report.jobs:
-        name = f"[{job.name}]({job.web_url})" if job.web_url else job.name
-        table.add(job.stage, name, f"`{job.status_label}`", fmt.duration(job.duration), job.failure_reason or "—", str(job.id))
-    out += ["", "## Jobs", "", table.render_markdown()]
+    if report.include_retried:
+        out.append(f"- **Tentativas descartadas**: {report.retried} (fora da contagem)")
+    out += ["", "## Jobs", "", _status_jobs_table(report, markdown=True).render_markdown()]
     if report.hidden:
         out += ["", f"_+{report.hidden} jobs fora da lista_"]
 
