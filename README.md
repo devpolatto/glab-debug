@@ -72,6 +72,86 @@ Opções:
 O código de saída é `1` quando algum job falhou e `2` em erro de execução — dá para usar
 em script.
 
+### `pipeline status`
+
+Em que pé está um pipeline e quais jobs importam. Responde "o deploy do MR passou?" sem
+listar os jobs `manual`/`created`/`skipped`, que num pipeline GitOps são a maioria.
+
+```bash
+glab-debug -f compact pipeline status -p cix/devops/ci-deployments/cix-app-helmfiles --mr 50
+```
+
+```
+pipeline 67511 cix/devops/ci-deployments/cix-app-helmfiles ref=main sha=6f7a024d status=manual source=push via=merge_commit mr=!50 mr_state=merged
+url https://gitlab.govone.digital/cix/devops/ci-deployments/cix-app-helmfiles/-/pipelines/67511
+counts created=7 manual=7 skipped=1 success=1
+jobs stage/name status dur reason id
+deploy/deploy:govone-v2-africa-prd success 86.8 - 366779
++15 jobs fora da lista
+```
+
+| alvo | resolve para |
+|:---|:---|
+| `<pipeline-id>` | o próprio pipeline |
+| `--sha SHA` | o pipeline mais recente do commit (aceita SHA curto) |
+| `--ref REF` | o último pipeline do branch/tag |
+| `--mr IID` | **mergeado**: o pipeline do merge commit no branch alvo (`via=merge_commit`), que é o do deploy. **Aberto**: o pipeline do MR (`via=head_pipeline`), com aviso |
+
+| flag | efeito |
+|:---|:---|
+| `--job GLOB` | filtra por nome (`fnmatch`, repetível); jobs filtrados aparecem em qualquer estado |
+| `--all` | lista todos os jobs |
+| `--retried` | inclui tentativas descartadas de jobs reexecutados (coluna `attempt`, ex. `1/2`). Elas **não** entram na contagem nem no código de saída — vale a última tentativa, como na UI — e uma tentativa falha seguida de sucesso vira aviso de instabilidade |
+| `--wait` | espera o pipeline — ou só os jobs filtrados — sair de `created/pending/running…`. `manual` conta como final |
+| `--interval`, `--wait-timeout` | polling do `--wait` (default 15s e 1800s) |
+
+Saída: `0` ok (inclui `manual`) · `1` job falhou sem `allow_failure`, ou pipeline `failed`
+sem job falho (erro de criação: YAML, rules, include) · `2` erro de execução · `3`
+`--wait-timeout` estourado. Falha prevalece sobre timeout.
+
+### `job log`
+
+Trecho do log de um job, limpo (sem prefixo do runner, ANSI, `\r` nem marcadores de
+seção) e **redigido**. Teto de 400 linhas por job.
+
+```bash
+glab-debug -f compact job log -p 621 324417 --tail 40
+glab-debug -f compact job log -p 621 --pipeline 58087 --failed --grep 'error|Error' --context 2
+glab-debug -f compact job log -p 621 324417 --sections      # seções com duração, sem conteúdo
+```
+
+Seleção: `<job-id>`, ou `--pipeline ID` com `--job GLOB` e/ou `--failed` (um bloco por job).
+
+### `job helmfile`
+
+Resumo de um job de `helmfile apply|diff|sync`: o que foi comparado, o que mudou, o que o
+helm atualizou e como terminou.
+
+```bash
+glab-debug -f compact job helmfile -p cix/devops/ci-deployments/cix-app-helmfiles 366779
+```
+
+```
+job 366779 deploy/deploy:govone-v2-africa-prd status=success result=succeeded
+url https://gitlab.govone.digital/cix/devops/ci-deployments/cix-app-helmfiles/-/jobs/366779
+compared(10) admin-govone-africa central-atendimento-govone-africa … websocket-painel-africa
+changed master/portal-govone-africa-portal Deployment
+updated portal-govone-africa ns=master chart=govone-v2 version=0.1.7 duration=1s
+```
+
+`nochanges` aparece quando nada mudou (apply no-op). O corpo do diff só sai com `--diff`.
+Saída `1` quando o job ou o helmfile falhou. Formato de referência: helmfile v0.171 +
+helm-diff.
+
+### Redação
+
+Tudo que o `job log` e o `job helmfile` imprimem passa por `redact.py`, e **não há flag
+para desligar**: o trace de um deploy roda sobre secrets decifrados e o `helm diff` mostra
+o `env` dos Deployments em claro. Cobre `env` do Kubernetes com nome sensível (inclusive as
+duas linhas `-`/`+` de um valor alterado), atribuições `NOME=valor`/`nome: valor`, senha em
+URL, `Authorization`, chave AWS, JWT e token do GitLab. A saída traz `redacted=N` quando
+houve corte. Quem precisa do valor cru abre o job na interface do GitLab.
+
 ## Formatos e custo em tokens
 
 Quando a saída vai para um LLM (Claude Code lendo o resultado), o formato é custo direto.
@@ -138,8 +218,12 @@ src/glab_debug/
   gitlab.py        cliente: subprocess sobre `glab api`, paginação, normalização de projeto
   analysis.py      onde os números são derivados (união de intervalos, stages, alertas)
   fmt.py           cor, duração, tabela (texto e markdown), barra de tempo
+  trace.py         limpeza do trace cru (prefixo do runner, ANSI, seções) e recortes
+  redact.py        redação de credenciais, aplicada a todo texto de trace
+  helmfile.py      parse do trace de helmfile apply/diff/sync
   commands/
-    pipeline.py    grupo `pipeline` e o subcomando `monitor`
+    pipeline.py    grupo `pipeline`: `monitor` e `status`
+    job.py         grupo `job`: `log` e `helmfile`
 ```
 
 Para adicionar um grupo: crie `commands/<nome>.py` com uma função `register(subparsers)` e

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync                                   # cria .venv com deps + grupo dev
-uv run pytest                             # suíte inteira (38 testes, ~0.2s)
+uv run pytest                             # suíte inteira (~100 testes, ~0.2s)
 uv run pytest tests/test_analysis.py      # um arquivo
 uv run pytest -k union_seconds            # um teste por nome
 uv run glab-debug pipeline monitor 58185  # roda a CLI do repositório
@@ -47,6 +47,35 @@ glab api (subprocess) → payloads pydantic → relatório derivado → renderiz
   `Table` (renderiza texto *e* markdown), `timeline_bar`. Largura de coluna usa
   `visible_len`, que ignora ANSI.
 
+### Tentativas reexecutadas no `status`
+
+Com `--retried`, a API devolve também as tentativas descartadas. `analysis.analyse_status`
+agrupa por `(stage, name)` e ordena por ID (retry ganha ID maior). **Só a última tentativa
+decide o resultado**: `counts`, `erro` e o código de saída saem de `latest`. As anteriores
+aparecem na lista, e uma falha seguida de sucesso vira `aviso`. A ordenação usa o início da
+*primeira* tentativa, para um retry tardio não empurrar o job para depois dos stages
+seguintes. O `--wait` também olha só a última tentativa.
+
+### Trace: limpeza, redação e helmfile
+
+Os comandos do grupo `job` leem o trace cru, que não é JSON (`GitLabClient.get_text`). O
+fluxo é sempre `trace.clean` → `redact.redact` → recorte (`tail`/`grep`) ou
+`helmfile.parse` → renderizador. Três módulos puros, testáveis sem rede:
+
+- **`trace.py`** — o prefixo do runner é `<timestamp> <stream><O|E>` seguido de espaço ou
+  de `+`, que marca continuação da linha anterior. Os marcadores
+  `section_start|end:<epoch>:<nome>` podem aparecer no meio de uma linha física, e o `\r`
+  de barra de progresso mantém só o último trecho. `MAX_LINES` é o teto de saída.
+- **`redact.py`** — **invariante de segurança: nenhum texto de trace sai sem passar por
+  aqui, e não existe flag para desligar.** O único estado é "a linha anterior foi `name:
+  <SENSÍVEL>`": ele continua ativo por linhas `value:` seguidas, porque o helm-diff mostra
+  um valor alterado em duas linhas (`-`/`+`). `tests/test_job.py` prova ponta a ponta que
+  nenhum valor sintético vaza em nenhum dos quatro formatos. Ao adicionar um comando que
+  imprime trace, estenda esse teste.
+- **`helmfile.py`** — as fronteiras de um bloco de diff (`_is_boundary`) são o ponto frágil:
+  linha nova do helmfile que não for reconhecida como fronteira vai parar no corpo do diff
+  do objeto anterior.
+
 ### Grupos de comandos
 
 `cli.py` monta `grupo → subcomando` com argparse e delega para `args.handler(args,
@@ -70,7 +99,8 @@ A cor é desligada à força quando `output_format != "table"` (`cli.py`), para 
 ### Códigos de saída
 
 `0` ok · `1` algum alerta de nível `erro` (job falhou) · `2` erro de execução (`GlabError`)
-ou config inválida · `130` interrupção. São contrato para uso em script.
+ou config inválida · `3` `pipeline status --wait` estourou o timeout (falha prevalece) ·
+`130` interrupção. São contrato para uso em script.
 
 ## Configuração
 

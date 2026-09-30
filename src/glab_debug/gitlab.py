@@ -17,7 +17,7 @@ from urllib.parse import quote, urlparse
 from pydantic import TypeAdapter
 
 from .config import Settings
-from .models import Job, Pipeline, Project
+from .models import Job, MergeRequest, Pipeline, Project
 
 
 class GlabError(RuntimeError):
@@ -106,6 +106,10 @@ class GitLabClient:
     def get(self, path: str, **params: Any) -> Any:
         return json.loads(self._run(_with_params(path, params)) or "null")
 
+    def get_text(self, path: str) -> str:
+        """Resposta crua, para rotas que não devolvem JSON (trace de job)."""
+        return self._run(path)
+
     def get_all(self, path: str, **params: Any) -> list[Any]:
         """Pagina manualmente — o resultado do `--paginate` do glab não é um JSON único."""
         items: list[Any] = []
@@ -136,6 +140,33 @@ class GitLabClient:
         if include_retried:
             params["include_retried"] = "true"
         return TypeAdapter(list[Job]).validate_python(self.get_all(path, **params))
+
+    def pipelines_by_sha(self, project: str, sha: str, ref: str | None = None) -> list[Pipeline]:
+        """Pipelines de um commit, da mais recente para a mais antiga."""
+        path = f"projects/{project_ref(project)}/pipelines"
+        payload = self.get(path, sha=sha, ref=ref, order_by="id", sort="desc", per_page=20)
+        return TypeAdapter(list[Pipeline]).validate_python(payload or [])
+
+    def full_sha(self, project: str, sha: str) -> str:
+        """O filtro `sha=` da API só aceita o SHA completo; expande o curto pelo commit."""
+        if len(sha) == 40:
+            return sha
+        payload = self.get(f"projects/{project_ref(project)}/repository/commits/{quote(sha, safe='')}")
+        return payload["id"]
+
+    def latest_pipeline(self, project: str, ref: str) -> Pipeline:
+        payload = self.get(f"projects/{project_ref(project)}/pipelines/latest", ref=ref)
+        return Pipeline.model_validate(payload)
+
+    def merge_request(self, project: str, iid: int) -> MergeRequest:
+        payload = self.get(f"projects/{project_ref(project)}/merge_requests/{iid}")
+        return MergeRequest.model_validate(payload)
+
+    def job(self, project: str, job_id: int) -> Job:
+        return Job.model_validate(self.get(f"projects/{project_ref(project)}/jobs/{job_id}"))
+
+    def job_trace(self, project: str, job_id: int) -> str:
+        return self.get_text(f"projects/{project_ref(project)}/jobs/{job_id}/trace")
 
     def pipeline_bridges(self, project: str, pipeline_id: int) -> list[dict[str, Any]]:
         path = f"projects/{project_ref(project)}/pipelines/{pipeline_id}/bridges"
