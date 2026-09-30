@@ -11,6 +11,9 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .helmfile import HelmfileSummary
+from .trace import Section
+
 AlertLevel = Literal["erro", "aviso", "info"]
 
 
@@ -238,3 +241,36 @@ class StatusReport(BaseModel):
     alerts: list[Alert]
     waited: float | None = Field(default=None, description="Segundos aguardando com --wait.")
     timed_out: bool = False
+
+
+# --------------------------------------------------------------------------- #
+# job log / job helmfile
+# --------------------------------------------------------------------------- #
+
+
+class LogReport(BaseModel):
+    """Trecho do log de um job, já limpo e redigido."""
+
+    job: StatusJob
+    mode: str = Field(description="tail | grep | sections")
+    pattern: str | None = None
+    total_lines: int
+    rows: list[tuple[int, str]] = Field(default_factory=list)
+    truncated: int = 0
+    matches: int | None = None
+    sections: list[Section] = Field(default_factory=list)
+    redacted: int = 0
+
+
+class HelmfileReport(BaseModel):
+    job: StatusJob
+    summary: HelmfileSummary
+    show_diff: bool = False
+    redacted: int = 0
+
+
+class JobsOutput(BaseModel):
+    """Envelope do formato json: um relatório por job selecionado."""
+
+    project: Project
+    reports: list[LogReport] | list[HelmfileReport]

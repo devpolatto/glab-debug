@@ -21,6 +21,21 @@ def test_env_do_kubernetes_redige_o_value_da_linha_seguinte():
     assert count == 1
 
 
+def test_env_alterado_no_diff_redige_as_duas_linhas_de_valor():
+    lines = [
+        "            - name: DB_PASSWORD",
+        '-             value: "antiga"',
+        '+             value: "nova"',
+        "            - name: LOG_LEVEL",
+        "              value: info",
+    ]
+    out, count = redact(lines)
+    assert out[1] == f"-             value: {MASK}"
+    assert out[2] == f"+             value: {MASK}"
+    assert out[4] == "              value: info"
+    assert count == 2
+
+
 def test_env_so_redige_o_value_imediatamente_seguinte():
     out, count = redact(["- name: API_TOKEN", "  valueFrom:", "    value: nao-e-o-dele"])
     assert out[2] == "    value: nao-e-o-dele"

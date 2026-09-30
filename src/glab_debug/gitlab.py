@@ -147,6 +147,13 @@ class GitLabClient:
         payload = self.get(path, sha=sha, ref=ref, order_by="id", sort="desc", per_page=20)
         return TypeAdapter(list[Pipeline]).validate_python(payload or [])
 
+    def full_sha(self, project: str, sha: str) -> str:
+        """O filtro `sha=` da API só aceita o SHA completo; expande o curto pelo commit."""
+        if len(sha) == 40:
+            return sha
+        payload = self.get(f"projects/{project_ref(project)}/repository/commits/{quote(sha, safe='')}")
+        return payload["id"]
+
     def latest_pipeline(self, project: str, ref: str) -> Pipeline:
         payload = self.get(f"projects/{project_ref(project)}/pipelines/latest", ref=ref)
         return Pipeline.model_validate(payload)

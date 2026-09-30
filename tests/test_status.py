@@ -128,6 +128,9 @@ class FakeClient:
     def pipeline(self, project, pipeline_id):
         return make_pipeline(id=pipeline_id)
 
+    def full_sha(self, project, sha):
+        return sha
+
     def latest_pipeline(self, project, ref):
         return make_pipeline(id=999, ref=ref)
 

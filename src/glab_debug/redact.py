@@ -6,7 +6,8 @@ claro o `env` dos Deployments. Quem precisa do valor cru abre o job na interface
 GitLab.
 
 A redação é por linha, com um único estado: a linha anterior ter sido um
-`name: <SENSÍVEL>` do formato de `env` do Kubernetes, cujo valor vem na linha seguinte.
+`name: <SENSÍVEL>` do formato de `env` do Kubernetes, cujo valor vem na linha seguinte
+— ou nas duas seguintes, quando é um diff (`-  value: antigo` / `+  value: novo`).
 """
 
 from __future__ import annotations
@@ -71,7 +72,12 @@ class Redactor:
 
         if pending:
             match = _ENV_VALUE.match(text)
-            if match and not _already_masked(match["val"]):
+            if match:
+                # Continua ativo: no helm-diff, um valor alterado vem em duas linhas
+                # seguidas (`-  value: antigo` / `+  value: novo`).
+                self._pending_env_value = True
+                if _already_masked(match["val"]):
+                    return text
                 self.count += 1
                 return match["pre"] + MASK
 

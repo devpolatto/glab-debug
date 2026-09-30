@@ -154,9 +154,10 @@ def resolve_pipeline(
     if args.ref:
         return client.latest_pipeline(project, args.ref), None, None
     if args.sha:
-        found = client.pipelines_by_sha(project, args.sha)
+        sha = client.full_sha(project, args.sha)
+        found = client.pipelines_by_sha(project, sha)
         if not found:
-            raise GlabError(f"Nenhum pipeline para o commit {args.sha}.")
+            raise GlabError(f"Nenhum pipeline para o commit {sha[:8]}.")
         return client.pipeline(project, found[0].id), None, None
 
     mr = client.merge_request(project, args.mr)
