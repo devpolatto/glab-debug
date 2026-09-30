@@ -1,6 +1,20 @@
 # Spec: `pipeline status`, `job log`, `job helmfile` + agent `gitlab-pipeline`
 
-Status: **proposta**, aguardando revisão. Data: 2026-09-30.
+Status: **implementada** em `feat/status-log-helmfile` (2026-09-30).
+
+Desvios em relação à proposta, todos achados nos testes contra pipelines reais:
+
+- O `--wait` (passo 5) entrou junto com o `pipeline status` (passo 2), porque era pequeno.
+- `--sha` aceita SHA curto: o filtro `sha=` da API só casa com o SHA completo, então o
+  curto é expandido via `repository/commits/:sha`.
+- Pipeline `failed` sem nenhum job falho (erro de criação: YAML, rules, include) virou
+  alerta de `erro` e exit `1`. Antes saía `0` e sem alerta nenhum (caso real: pipeline
+  67177 do admin-api).
+- Redação: um env sensível alterado aparece no helm-diff em duas linhas de valor
+  (`-`/`+`). A primeira versão só redigia a primeira, e o teste ponta a ponta pegou o
+  vazamento.
+- O parser do helmfile trata `Upgrading release=` e `Release "…" has been upgraded` como
+  fronteira de diff.
 
 ## Motivação
 
